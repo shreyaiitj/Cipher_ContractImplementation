@@ -1,0 +1,38 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+test = "test"
+script = "script"
+
+# Compiler Settings
+solc = "0.8.24"
+evm_version = "cancun" # For latest EVM features like transient storage
+
+# Gas Optimization 
+optimizer = true 
+via_ir = true           # Helps to bypass stack too deep errors
+
+# To know how much gas functions are using 
+gas_reports = ["ProviderRegistration", "ChannelManager", "ClaimTicket"]
+
+# Fuzzing Defaults
+[profile.default.fuzz]
+runs = 1000 
+
+[profile.ci]
+fuzz = { runs = 10000 } # Deep fuzzing 
+verbosity = 3           # controls how much logging output forge test prints
+
+# Local Development 
+[profile.dev]
+via_ir = false         # Turn off Yul IR locally 
+
+remappings = [
+    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+    "forge-std/=lib/forge-std/src/"
+]
+
+[rpc_endpoints]
+anvil = "http://localhost:8545"
+sepolia = "https://sepolia.drpc.org"
