@@ -308,3 +308,4 @@ contract CipherTest is Test {
         assertTrue(broker.isNullifierUsed(_getNullifier(ticket)));
     }
 }
+
