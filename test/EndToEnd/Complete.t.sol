@@ -2,150 +2,161 @@
 pragma solidity ^0.8.24;
 
 import "forge-std/Test.sol";
-import "../src/ProviderRegistration.sol";
-import "../src/ChannelManager.sol";
-import "../src/ClaimTicket.sol";
+import "../../src/Contract.sol";
 
+// Testing provider registry, off-chain probabilistic payments, and commit-reveal workflow
 contract CipherTest is Test {
-    ProviderRegistration public reg;
-    ChannelManager public cm;
-    TicketLottery public tl;
+    CipherContract public broker;
 
-    address public client = address(0xCA11);
+    // Hardcoded test actors and signatures setup
+    address public client;
     address public provider = address(0xBEEF);
-    uint256 public clientPk = 0xA11CE;
+    uint256 public clientPk = 0xA11CE; // Client private key for vm.sign
 
     function setUp() public {
-        // Deploy and wire up
-        reg = new ProviderRegistration();
-        tl = new TicketLottery(address(cm), address(reg));
-        cm = new ChannelManager(address(reg), address(tl));
+        client = vm.addr(clientPk);
+        broker = new CipherContract();
 
-        // Fund both parties
+        // Funding initial balances so test actors can stake & fund channels
         vm.deal(provider, 10 ether);
         vm.deal(client, 10 ether);
 
-        // Register provider (shared setup for most tests)
+        // Provider registration (MIN_PROVIDER_STAKE = 1 ether)
         vm.prank(provider);
-        reg.registerProvider{value: 10 ether}();
+        broker.registerProvider{value: 1 ether}();
 
-        // Open a channel (shared setup)
+        // Client opens payment channel with 5 ether deposit
         vm.prank(client);
-        cm.openChannel{value: 5 ether}(provider);
+        broker.openChannel{value: 5 ether}(provider);
     }
 
-    // helpers
-
+    // Helper: Handles the commit-reveal cycle for salt randomness off-chain/on-chain
     function _commitRevealSalt() internal returns (bytes32) {
         bytes32 salt = keccak256(abi.encodePacked("secret"));
         bytes32 commit = keccak256(abi.encodePacked(salt));
 
+        // Step 1: Provider submits commitment
         vm.prank(provider);
-        tl.commitSalt(commit);
+        broker.commitSalt(commit);
 
+        // Step 2: Provider reveals underlying salt pre-image
         vm.prank(provider);
-        tl.revealSalt(commit, salt);
+        broker.revealSalt(commit, salt);
 
         return commit;
     }
 
-    function _signTicket(TicketLottery.Ticket memory ticket) internal view returns (bytes memory) {
-        bytes32 digest = tl.getHash(ticket);
+    // Helper: ECDSA signature generation matching ECDSA/MessageHashUtils spec
+    function _signTicket(CipherContract.Ticket memory ticket) internal view returns (bytes memory) {
+        bytes32 digest = broker.getHash(ticket);
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(clientPk, digest);
         return abi.encodePacked(r, s, v);
     }
 
-    // tests
-
+    // PROVIDER REGISTRATION & UNSTAKING TESTS 
     function test_RegisterAndUnregister() public {
-        assertTrue(reg.isRegistered(provider));
-        assertEq(reg.stakeOf(provider), 10 ether);
+        assertTrue(broker.isProvider(provider));
+        assertEq(broker.stakeOf(provider), 1 ether);
+
+        // Initiate unbonding time-lock window
+        vm.prank(provider);
+        broker.requestUnstake();
+
+        // Warp past UNBONDING_PERIOD (~7200 blocks)
+        // Delay complete skip krne ke liye roll kr standard block window forward
+        vm.roll(block.number + 7200 + 1);
 
         uint256 before = provider.balance;
         vm.prank(provider);
-        reg.unregisterProvider();
+        broker.withdrawStake();
 
-        assertFalse(reg.isRegistered(provider));
-        assertEq(provider.balance - before, 10 ether);
+        // Verification: Ensure provider un-registered properly and stake returned
+        assertFalse(broker.isProvider(provider));
+        assertEq(provider.balance - before, 1 ether);
     }
 
+
     function test_OpenAndCloseChannel() public {
-        uint256 id = 1; // first channel
-        (address cl, address pr, uint256 deposit, , , bool closed) = cm.getChannel(id);
+        uint256 id = 1;
+        (address cl, address pr, uint256 deposit, uint256 spent, uint256 unlockBlock) = broker.getChannel(id);
+        
         assertEq(cl, client);
         assertEq(pr, provider);
         assertEq(deposit, 5 ether);
-        assertFalse(closed);
+        assertEq(spent, 0);
+        assertEq(unlockBlock, 0);
 
-        uint256 before = client.balance;
+        // Client initiates channel unlock request
         vm.prank(client);
-        cm.closeChannel(id);
+        broker.closeChannel(id);
 
-        (, , , , , closed) = cm.getChannel(id);
-        assertTrue(closed);
-        assertEq(client.balance - before, 5 ether);
+        // Unlock block must be scheduled in future to give provider time to redeem outstanding tickets
+        (, , , , unlockBlock) = broker.getChannel(id);
+        assertTrue(unlockBlock > 0);
     }
 
+    //  COMMIT-REVEAL SYSTEM TESTS
     function test_CommitAndRevealSalt() public {
         bytes32 salt = keccak256(abi.encodePacked("test"));
         bytes32 commit = keccak256(abi.encodePacked(salt));
 
         vm.prank(provider);
-        tl.commitSalt(commit);
+        broker.commitSalt(commit);
 
         vm.prank(provider);
-        tl.revealSalt(commit, salt);
+        broker.revealSalt(commit, salt);
 
-        assertEq(tl.getSalt(commit), salt);
+        // Verify state persistence of pre-image reveal
+        assertEq(broker.getSalt(commit), salt);
     }
 
+    //  TICKET CLAIM & PROBABILISTIC PAYOUT TESTS 
     function test_WinningTicketPaysOut() public {
         bytes32 commit = _commitRevealSalt();
 
+        // Setting up a guaranteed winning ticket (winProb = 100%)
         uint256 futureBlock = block.number + 5;
-        TicketLottery.Ticket memory ticket = TicketLottery.Ticket({
+        CipherContract.Ticket memory ticket = CipherContract.Ticket({
             channelId: 1,
             client: client,
             provider: provider,
             amount: 0.5 ether,
             nonce: 1,
             futureBlock: futureBlock,
-            winProb: 100, // guaranteed win
+            winProbab: 100,
             saltCommit: commit
         });
 
         bytes memory sig = _signTicket(ticket);
 
-        // mine to the target block
+        // Need to roll past futureBlock for randomness blockhash confirmation
         vm.roll(futureBlock + 1);
 
         uint256 before = provider.balance;
         vm.prank(provider);
-        tl.claimTicket(ticket, sig);
+        broker.claimTicket(ticket, sig);
 
+        // Verify payout and double-spend nullifier tracking
         assertEq(provider.balance - before, 0.5 ether);
+        assertTrue(broker.isNullifierUsed(broker._getNullifier(ticket)));
 
-        // nullifier is marked
-        bytes32 nullifier = tl._getNullifier(ticket);
-        assertTrue(tl.isNullifierUsed(nullifier));
-
-        // channel spent
-        (, , , uint256 spent, , ) = cm.getChannel(1);
+        (, , , uint256 spent, ) = broker.getChannel(1);
         assertEq(spent, 0.5 ether);
     }
 
     function test_LosingTicketDoesNotPayOut() public {
         bytes32 commit = _commitRevealSalt();
 
+        // Setting guaranteed losing condition probability threshold
         uint256 futureBlock = block.number + 5;
-        TicketLottery.Ticket memory ticket = TicketLottery.Ticket({
+        CipherContract.Ticket memory ticket = CipherContract.Ticket({
             channelId: 1,
             client: client,
             provider: provider,
             amount: 0.5 ether,
             nonce: 2,
             futureBlock: futureBlock,
-            winProb: 1, // 1% chance (virtually guaranteed loss)
+            winProbab: 1, // Extremely low win condition
             saltCommit: commit
         });
 
@@ -155,28 +166,26 @@ contract CipherTest is Test {
 
         uint256 before = provider.balance;
         vm.prank(provider);
-        tl.claimTicket(ticket, sig);
+        broker.claimTicket(ticket, sig);
 
-        // no payout
+        // Money remains in channel, but nullifier consumed anyway so ticket can't be replayed!
         assertEq(provider.balance, before);
-
-        // still marks nullifier to prevent replay
-        bytes32 nullifier = tl._getNullifier(ticket);
-        assertTrue(tl.isNullifierUsed(nullifier));
+        assertTrue(broker.isNullifierUsed(broker._getNullifier(ticket)));
     }
 
+    // SECURITY TESTS
     function test_ReplayTicketFails() public {
         bytes32 commit = _commitRevealSalt();
 
         uint256 futureBlock = block.number + 5;
-        TicketLottery.Ticket memory ticket = TicketLottery.Ticket({
+        CipherContract.Ticket memory ticket = CipherContract.Ticket({
             channelId: 1,
             client: client,
             provider: provider,
             amount: 0.5 ether,
             nonce: 3,
             futureBlock: futureBlock,
-            winProb: 1,
+            winProbab: 1,
             saltCommit: commit
         });
 
@@ -184,55 +193,58 @@ contract CipherTest is Test {
 
         vm.roll(futureBlock + 1);
 
-        // first claim lost but marks nullifier
+        // First attempt succeeds
         vm.prank(provider);
-        tl.claimTicket(ticket, sig);
+        broker.claimTicket(ticket, sig);
 
-        // second claim with same ticket
+        // THE FAMOUS DOUBLE SPEND ATTACK Replay attempt must revert
         vm.prank(provider);
-        vm.expectRevert(TicketLottery.TicketUsed.selector);
-        tl.claimTicket(ticket, sig);
+        vm.expectRevert(CipherContract.TicketUsed.selector);
+        broker.claimTicket(ticket, sig);
     }
 
     function test_InvalidSignatureFails() public {
         bytes32 commit = _commitRevealSalt();
 
         uint256 futureBlock = block.number + 5;
-        TicketLottery.Ticket memory ticket = TicketLottery.Ticket({
+        CipherContract.Ticket memory ticket = CipherContract.Ticket({
             channelId: 1,
             client: client,
             provider: provider,
             amount: 0.5 ether,
             nonce: 4,
             futureBlock: futureBlock,
-            winProb: 50,
+            winProbab: 50,
             saltCommit: commit
         });
 
-        // sign with a random key 
-        bytes32 digest = tl.getHash(ticket);
+        // Sign with an unauthorized private key (0xDEAD)
+        bytes32 digest = broker.getHash(ticket);
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(0xDEAD, digest);
         bytes memory sig = abi.encodePacked(r, s, v);
 
         vm.roll(futureBlock + 1);
         vm.prank(provider);
-        vm.expectRevert(TicketLottery.BadSigner.selector);
-        tl.claimTicket(ticket, sig);
+        
+        // Custom error check for cryptographic signer validation
+        vm.expectRevert(CipherContract.BadSigner.selector);
+        broker.claimTicket(ticket, sig);
     }
 
     function test_AntiDrainProtection() public {
         bytes32 commit = _commitRevealSalt();
 
-        // 2 ETH is 40% of the 5 ETH channel, which exceeds the 25% limit
         uint256 futureBlock = block.number + 5;
-        TicketLottery.Ticket memory ticket = TicketLottery.Ticket({
+        
+        // Attempting to claim amount exceeding channel limit balance threshold
+        CipherContract.Ticket memory ticket = CipherContract.Ticket({
             channelId: 1,
             client: client,
             provider: provider,
-            amount: 2 ether,
+            amount: 2 ether, // Ticket value higher than remaining liquid capacity
             nonce: 5,
             futureBlock: futureBlock,
-            winProb: 100,
+            winProbab: 100,
             saltCommit: commit
         });
 
@@ -240,26 +252,28 @@ contract CipherTest is Test {
 
         vm.roll(futureBlock + 1);
         vm.prank(provider);
-        vm.expectRevert("Ticket exceeds limit");
-        tl.claimTicket(ticket, sig);
+        
+        // Prevents malicious provider draining logic
+        vm.expectRevert(CipherContract.TicketExceedsLimit.selector);
+        broker.claimTicket(ticket, sig);
     }
 
-    function testFuzz_WinProbability(uint8 winProb) public {
-        // only test valid range
-        vm.assume(winProb >= 1 && winProb <= 100);
-        if (winProb > 100) winProb = 100;
+    // FUZZ TESTING 
+    function testFuzz_WinProbability(uint8 winProbab) public {
+        // Bound random inputs to valid percentage range
+        vm.assume(winProbab >= 1 && winProbab <= 100);
 
         bytes32 commit = _commitRevealSalt();
 
         uint256 futureBlock = block.number + 5;
-        TicketLottery.Ticket memory ticket = TicketLottery.Ticket({
+        CipherContract.Ticket memory ticket = CipherContract.Ticket({
             channelId: 1,
             client: client,
             provider: provider,
             amount: 0.1 ether,
-            nonce: uint256(keccak256(abi.encodePacked(winProb))),
+            nonce: uint256(keccak256(abi.encodePacked(winProbab))),
             futureBlock: futureBlock,
-            winProb: winProb,
+            winProbab: winProbab,
             saltCommit: commit
         });
 
@@ -267,12 +281,10 @@ contract CipherTest is Test {
 
         vm.roll(futureBlock + 1);
 
-        uint256 before = provider.balance;
         vm.prank(provider);
-        tl.claimTicket(ticket, sig);
+        broker.claimTicket(ticket, sig);
 
-        // either won or lost but either way the nullifier is used
-        bytes32 nullifier = tl._getNullifier(ticket);
-        assertTrue(tl.isNullifierUsed(nullifier));
+        // Verification: Regardless of win/loss outcome, nullifier must be consumed
+        assertTrue(broker.isNullifierUsed(broker._getNullifier(ticket)));
     }
 }

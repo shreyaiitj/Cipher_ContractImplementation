@@ -1,0 +1,10 @@
+# Foundry directories
+out/
+cache/
+
+# Local binaries
+foundry_bin/
+
+# IDE files
+.vscode/
+.idea/
