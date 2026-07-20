@@ -10,7 +10,7 @@ contract DeployCipher is Script {
 
         vm.startBroadcast(deployerPrivateKey);
 
-        CipherContract broker = new CipherContract();
+        CipherContract broker = new CipherContract(vm.addr(deployerPrivateKey));
         console.log("CipherContract deployed to:", address(broker));
 
         vm.stopBroadcast();

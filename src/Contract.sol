@@ -1,120 +1,107 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-contract CipherContract {
+// OpenZeppelin ka standard guard import kiya hai taaki safe transfers ho sakein aur reentrancy attack na ho.
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-    // Constants
+contract CipherContract is ReentrancyGuard {
 
-    // Minimum stake required to register as a provider.
+    // --- State Variables (Contract ki settings aur parameters) ---
+
+    // Provider ko register karne ke liye kam se kam 1 ETH security deposit (stake) lock karna padega.
     uint256 public constant minStake = 1 ether;
 
-    // Denominator for probability calculations (1% granularity).
+    // Probability (percentage) check karne ke liye base number 100 set kiya hai.
     uint256 public constant probabDenom = 100;
 
-    // Maximum number of blocks Ethereum stores blockhash for.
+    // EVM sirf last 256 blocks ka hi blockhash read kar sakta hai, so uski limit set ki hai.
     uint256 public constant blockLookback = 256;
 
-    // Maximum percentage of channel balance a single ticket can claim.
+    // Koi single ticket channel ke remaining balance ka 25% se zyada drain nahi kar sakti (anti-drain safety limit).
     uint256 public constant maxTicketPct = 25;
 
-    // Unbonding period for provider stakes and channel closures (~1 day).
+    // Provider unstake request karne ke baad lagbhag 1 day (7200 blocks) tak lock rehta hai.
     uint64 public constant unbondingPeriod = 7200;
 
-    // Custom Errors
+    // Channel close request karne ke baad provider ko pending ticket claims submit karne ke liye 12 hours (3600 blocks) milte hain.
+    uint64 public constant disputePeriod = 3600;
 
-    error AlreadyRegistered();
-    error NotRegistered();
-    error InvalidStake();
-    error ZeroAmount();
-    error TransferFailed();
-    error ChannelNotFound();
-    error ChannelLocked();
-    error NotChannelParty();
-    error InsufficientBalance();
-    error TicketUsed();
-    error BadSigner();
-    error SaltNotRevealed();
-    error InvalidBlock();
-    error SaltCommittedTooLate();
-    error TicketExceedsLimit();
-    error WinProbabTooHigh();
-    error ReentrancyGuardReentrantCall();
+    // --- Custom Errors (Kuch galat hone par gas bacha ke tx revert karne ke liye) ---
+    error AlreadyRegistered();      // Jab provider pehle se register ho aur firse apply kare.
+    error NotRegistered();          // Jab unregistered address provider functions call kare.
+    error InvalidStake();           // Stake amount 1 ETH se kam hone par error.
+    error ZeroAmount();             // Zero payment ya zero value transaction try karne par error.
+    error TransferFailed();         // ETH transfer fail hone par error.
+    error ChannelNotFound();        // Invalid channel ID use karne par error.
+    error ChannelLocked();          // Channel lock state me hone par claims block karne ke liye.
+    error NotChannelParty();        // Koi teesra banda channel functions access karne ki koshish kare tab.
+    error InsufficientBalance();    // Channel me claim amount se kam deposit hone par error.
+    error TicketUsed();             // Replay attack prevent karne ke liye (agar ticket pehle hi use ho chuki ho).
+    error BadSigner();              // Client ka signature verify na hone par custom error.
+    error SaltNotRevealed();        // Provider ne abhi tak salt value open (reveal) na ki ho.
+    error InvalidBlock();           // Blockhash history window (256 blocks) se purani block target karne par.
+    error SaltCommittedTooLate();   // Target block mine hone ke baad salt commit karne ki koshish par error.
+    error TicketExceedsLimit();     // Ticket value 25% safety limit cross karne par error.
+    error WinProbabTooHigh();       // Winning probability range (1-100) se bahar hone par.
+    error NoPendingWithdrawal();    // Provider ka balance account me zero hone par withdrawal request reject karne ke liye.
 
-    // Transient Storage Reentrancy Guard (EIP-1153)
+    // --- Structs (Data formats jo state store karne ke liye use hote hain) ---
 
-    // We use transient storage for the reentrancy guard because it's
-    // cheaper than persistent storage. The guard is set at the start
-    // of a guarded function and cleared at the end.
-    bytes32 private constant reentrancyGuardSlot =
-        keccak256("cipher.reentrancy.guard");
-
-    modifier nonReentrant() {
-        bytes32 slot = reentrancyGuardSlot;
-        assembly {
-            if tload(slot) {
-                mstore(0x00, 0x37ed32e8)
-                revert(0x1c, 0x04)
-            }
-            tstore(slot, 1)
-        }
-        _;
-        assembly {
-            tstore(slot, 0)
-        }
-    }
-
-    // Structs
-
-    // Provider state tracking stake amount, unstake release window, and registration flag.
+    // Provider ki info track karne ke liye struct
     struct Provider {
-        uint256 stake;
-        uint64 unstakeBlock;
-        bool registered;
+        uint256 stake;          // Lock kiya hua total deposit.
+        uint64 unstakeBlock;    // Block number jab unbonding complete hogi aur fund withdraw kar payenge.
+        bool registered;        // Provider actively registered hai ya nahi.
     }
 
-    // Payment channel state tracking client deposits, claims paid, and exit timelock.
+    // Client aur Provider ke beech active payment channel track karne ke liye struct
     struct Channel {
-        uint256 deposit;
-        uint256 spent;
-        uint64 unlockBlock;
+        uint256 deposit;            // Total paisa jo client ne lock kiya.
+        uint256 spent;              // Total payment jo provider ko approve ho chuki hai.
+        uint64 unlockBlock;         // Unlock block timestamp (is block ke baad client fund nikal sakta hai).
+        uint64 closureRequestedAt;  // Block jab channel close ki request aayi.
+        bool closureInitiated;      // Close process start ho chuka hai ya nahi.
     }
 
-    // Ticket payload signed by the client for probabilistic payments.
+    // Off-chain client jo payment ticket sign karke provider ko deta hai uski format
     struct Ticket {
-        uint256 channelId;
-        address client;
-        address provider;
-        uint256 amount;
-        uint256 nonce;
-        uint256 futureBlock;
-        uint256 winProbab;
-        bytes32 saltCommit;
+        uint256 channelId;      // Kis channel se paise niklenge.
+        address client;         // Client ka public wallet address.
+        address provider;       // Provider ka public wallet address.
+        uint256 amount;         // Is ticket ki payment value.
+        uint256 nonce;          // Serial number taaki unique ticket generate ho.
+        uint256 futureBlock;    // Randomness generate karne ke liye aane wala target block.
+        uint256 winProbab;      // Ticket jeetne ke probability chance (out of 100).
+        bytes32 saltCommit;     // Salt hash commitment jo provider ne register kiya hai.
     }
 
-    // Storage
+    // --- Mappings (Database variables) ---
+    mapping(address => Provider) public providers;          // Wallet address to Provider struct storage.
+    uint256 public nextChannelId = 1;                       // Naye channels ke liye counter.
+    mapping(uint256 => Channel) public channels;            // Channel ID to Channel state map.
+    mapping(uint256 => address) public channelClient;       // Channel client links.
+    mapping(uint256 => address) public channelProvider;     // Channel provider links.
 
-    // Provider registry map
-    mapping(address => Provider) public providers;
-
-    // Payment channel storage
-    uint256 public nextChannelId = 1;
-    mapping(uint256 => Channel) public channels;
-    mapping(uint256 => address) public channelClient;
-    mapping(uint256 => address) public channelProvider;
-
-    // Nullifier map prevents the same ticket from being claimed twice
+    // Ticket replay protect karne ke liye tracking map (Nullifier registry)
     mapping(bytes32 => bool) public usedNullifiers;
 
-    // Commit-reveal state for entropy generation
-    mapping(bytes32 => address) public saltOwner;
-    mapping(bytes32 => bytes32) public saltRevealed;
-    mapping(bytes32 => uint256) public saltCommitBlock;
+    // Randomness verify karne ke liye Provider ke pre-committed values ki mappings
+    mapping(bytes32 => address) public saltOwner;           // Salt hash kis provider ka hai.
+    mapping(bytes32 => bytes32) public saltRevealed;        // Commit hash ka original value kya tha.
+    mapping(bytes32 => uint256) public saltCommitBlock;     // Salt kis block me commit kiya gaya tha.
 
-    // Events
+    // Safe Pull-Payment: Provider ka claim kiya hua balance yahan store hota hai jise wo baad me withdraw karte hain
+    mapping(address => uint256) public pendingWithdrawals;
 
+    // Governance aur admin functions manage karne ke liye variables
+    address public owner;
+    address public treasury;
+
+    // --- Events (Log statements taaki tools track kar sakein on-chain events) ---
     event ProviderRegistered(address indexed provider, uint256 stake);
-    event ProviderUnregistered(address indexed provider, uint256 stake);
-    event ProviderSlashed(address indexed provider, uint256 amount);
+    event UnstakeRequested(address indexed provider, uint256 stake);
+    event ProviderWithdrawn(address indexed provider, uint256 stake);
+    event ProviderSlashed(address indexed provider, uint256 amount, address indexed to);
     event ChannelOpened(
         uint256 indexed channelId,
         address indexed client,
@@ -140,11 +127,32 @@ contract CipherContract {
         uint256 amount,
         bool won
     );
+    event TicketLost(
+        bytes32 indexed nullifier,
+        uint256 indexed channelId,
+        address indexed provider,
+        uint256 amount
+    );
+    event WithdrawalPending(
+        address indexed recipient,
+        uint256 amount
+    );
 
-    // Provider Registration Logic
+    // Constructor: Contract deploy karte time run hoga. Admin (owner) and treasury wallet assign karega.
+    constructor(address _treasury) {
+        owner = msg.sender;
+        treasury = _treasury;
+    }
 
-    // Register as a provider by staking ETH.
-    // The stake acts as a security bond that can be slashed for misbehaviour.
+    // Owner check karne ke liye modifier
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not owner");
+        _;
+    }
+
+    // --- Provider Registration Functions (Provider management logic) ---
+
+    // Provider register karne ke liye function. Call karte time ETH (deposit) lagana zaroori hai.
     function registerProvider() external payable {
         Provider storage p = providers[msg.sender];
         if (p.registered) revert AlreadyRegistered();
@@ -152,25 +160,25 @@ contract CipherContract {
 
         p.stake = msg.value;
         p.registered = true;
-        p.unstakeBlock = 0;
+        p.unstakeBlock = 0; // Lock resets.
 
         emit ProviderRegistered(msg.sender, msg.value);
     }
 
-    // Request to unregister as a provider.
-    // The stake enters an unbonding period before it can be withdrawn.
+    // Unstake start karne ke liye request. Direct withdraw allowed nahi hai (unbonding period lag jata hai).
+    // Provider register hi rahega taaki unbonding time me bhi old payments settle kar sake.
     function requestUnstake() external {
         Provider storage p = providers[msg.sender];
         if (!p.registered) revert NotRegistered();
         if (p.unstakeBlock != 0) revert("Already unbonding");
 
+        // Release window block update kar rahe hain. Is block number ke baad withdraw stake allowed hoga.
         p.unstakeBlock = uint64(block.number + unbondingPeriod);
-        p.registered = false;
 
-        emit ProviderUnregistered(msg.sender, p.stake);
+        emit UnstakeRequested(msg.sender, p.stake);
     }
 
-    // Withdraw the stake after the unbonding period has completed.
+    // Unbonding/waiting duration end hone ke baad, provider apna security deposit wapas lene ke liye ise call karega.
     function withdrawStake() external nonReentrant {
         Provider storage p = providers[msg.sender];
         if (p.unstakeBlock == 0) revert("Not unbonding");
@@ -179,44 +187,45 @@ contract CipherContract {
         uint256 amount = p.stake;
         p.stake = 0;
         p.unstakeBlock = 0;
+        p.registered = false; // Registration permanently cancel.
 
         (bool ok, ) = msg.sender.call{value: amount}("");
         if (!ok) revert TransferFailed();
 
-        emit ProviderUnregistered(msg.sender, amount);
+        emit ProviderWithdrawn(msg.sender, amount);
     }
 
-    // Slash a provider's stake for misbehaviour.
-    function slashProvider(address provider, uint256 amount) external {
+    // Slasher logic (Strictly onlyOwner): Agar provider bad activity kare, to admin unka stake cut (slash) karke treasury me bhej dega.
+    function slashProvider(address provider, uint256 amount) external onlyOwner {
         Provider storage p = providers[provider];
         if (!p.registered) revert NotRegistered();
 
         uint256 slashAmount = amount > p.stake ? p.stake : amount;
         p.stake -= slashAmount;
 
+        // Agar provider ka sara stake chala jaye, to automatic deregister kardo.
         if (p.stake == 0) {
             p.registered = false;
         }
 
-        (bool ok, ) = msg.sender.call{value: slashAmount}("");
+        (bool ok, ) = treasury.call{value: slashAmount}("");
         if (!ok) revert TransferFailed();
 
-        emit ProviderSlashed(provider, slashAmount);
+        emit ProviderSlashed(provider, slashAmount, treasury);
     }
 
-    // Check if an address is a registered provider.
+    // View helper functions: Active registration aur current stake check karne ke liye.
     function isProvider(address provider) external view returns (bool) {
         return providers[provider].registered;
     }
 
-    // Get a provider's current stake.
     function stakeOf(address provider) external view returns (uint256) {
         return providers[provider].stake;
     }
 
-    // Channel Management Logic
+    // --- Channel Management Functions (Channel lifecycle management) ---
 
-    // Open a payment channel with a registered provider.
+    // Naya micropayment channel kholne ke liye function. Client cash (deposit) lock karta hai provider ke against.
     function openChannel(address provider) external payable nonReentrant {
         if (!providers[provider].registered) revert NotRegistered();
         if (msg.value == 0) revert ZeroAmount();
@@ -228,28 +237,32 @@ contract CipherContract {
         channels[id] = Channel({
             deposit: msg.value,
             spent: 0,
-            unlockBlock: 0
+            unlockBlock: 0,
+            closureRequestedAt: 0,
+            closureInitiated: false
         });
 
         emit ChannelOpened(id, msg.sender, provider, msg.value);
     }
 
-    // Top up an existing channel with more funds.
+    // Active channel me additional balance/deposit top up karne ke liye.
     function topUpChannel(uint256 channelId) external payable nonReentrant {
         Channel storage c = channels[channelId];
         if (c.deposit == 0) revert ChannelNotFound();
-        if (c.unlockBlock != 0) revert ChannelLocked();
+        if (c.closureInitiated) revert ChannelLocked();
         if (msg.sender != channelClient[channelId]) revert NotChannelParty();
         if (msg.value == 0) revert ZeroAmount();
 
         c.deposit += msg.value;
     }
 
-    // Initiate closure of a payment channel.
+    // Client/Provider channel close karne ki request trigger karte hain.
+    // Provider ko safe rakhne ke liye, ek unbonding delay aur dispute windows (lock window) add ho jata hai.
+    // Is lock window ke andr provider outstanding claims submit kar sakta hai.
     function closeChannel(uint256 channelId) external nonReentrant {
         Channel storage c = channels[channelId];
         if (c.deposit == 0) revert ChannelNotFound();
-        if (c.unlockBlock != 0) revert ChannelLocked();
+        if (c.closureInitiated) revert ChannelLocked();
         if (
             msg.sender != channelClient[channelId] &&
             msg.sender != channelProvider[channelId]
@@ -257,19 +270,24 @@ contract CipherContract {
             revert NotChannelParty();
         }
 
-        c.unlockBlock = uint64(block.number + unbondingPeriod);
+        c.closureInitiated = true;
+        c.closureRequestedAt = uint64(block.number);
+        
+        // Pura exit timing = unbonding timer + 12-hour dispute delay.
+        c.unlockBlock = uint64(block.number + unbondingPeriod + disputePeriod);
     }
 
-    // Withdraw remaining funds from a closed channel after unbonding.
+    // Unlock period complete hone ke baad client remaining balances (deposit - spent) nikal sakta hai.
     function withdrawChannel(uint256 channelId) external nonReentrant {
         Channel storage c = channels[channelId];
         if (c.deposit == 0) revert ChannelNotFound();
-        if (c.unlockBlock == 0) revert("Channel not closing");
+        if (!c.closureInitiated) revert("Channel not closing");
         if (block.number < c.unlockBlock) revert("Unbonding not complete");
         if (msg.sender != channelClient[channelId]) revert NotChannelParty();
 
         uint256 remaining = c.deposit - c.spent;
         c.deposit = 0;
+        c.closureInitiated = false;
 
         (bool ok, ) = msg.sender.call{value: remaining}("");
         if (!ok) revert TransferFailed();
@@ -277,23 +295,37 @@ contract CipherContract {
         emit ChannelClosed(channelId, msg.sender, remaining);
     }
 
-    // Internal function to pay a provider from a channel.
+    // Micropayment internal handler: Balance deduct karta hai aur provider ke pending claim account me update karta hai.
+    // Agar channel close timing block cross ho chuka ho, tab balance freeze ho jata hai.
     function _payProvider(uint256 channelId, uint256 amount) internal {
         Channel storage c = channels[channelId];
         if (c.deposit == 0) revert ChannelNotFound();
+        if (c.closureInitiated && block.number >= c.unlockBlock) revert ChannelLocked();
         if (c.spent + amount > c.deposit) revert InsufficientBalance();
 
         c.spent += amount;
 
-        (bool ok, ) = channelProvider[channelId].call{value: amount}("");
-        if (!ok) revert TransferFailed();
+        address provider = channelProvider[channelId];
+        pendingWithdrawals[provider] += amount;
 
-        emit ChannelPaid(channelId, channelProvider[channelId], amount);
+        emit ChannelPaid(channelId, provider, amount);
+        emit WithdrawalPending(provider, amount);
     }
 
-    // Commit and Reveal Logic
+    // Pull-Payment: Provider is function se apne pure accumulated settlement payments nikal sakte hain (no reentrancy risk).
+    function withdrawPending() external nonReentrant {
+        uint256 amount = pendingWithdrawals[msg.sender];
+        if (amount == 0) revert NoPendingWithdrawal();
 
-    // Commit a salt hash before the target block is mined.
+        pendingWithdrawals[msg.sender] = 0;
+
+        (bool ok, ) = msg.sender.call{value: amount}("");
+        if (!ok) revert TransferFailed();
+    }
+
+    // --- Randomness Commit-Reveal Logic (Micropayment security design) ---
+
+    // Commit Step: Provider blockhash prediction attack prevent karne ke liye aane wale target block se pehle salt commit karta hai.
     function commitSalt(bytes32 commit) external {
         if (saltOwner[commit] != address(0)) revert("Already committed");
         saltOwner[commit] = msg.sender;
@@ -301,7 +333,7 @@ contract CipherContract {
         emit SaltCommitted(commit, msg.sender);
     }
 
-    // Reveal the salt after the target block is mined.
+    // Reveal Step: Aane wale target block ke mine ho jane par provider original secret reveal karta hai.
     function revealSalt(bytes32 commit, bytes32 salt) external {
         if (saltOwner[commit] != msg.sender) revert("Not the committer");
         if (saltRevealed[commit] != bytes32(0)) revert("Already revealed");
@@ -313,9 +345,7 @@ contract CipherContract {
         emit SaltRevealed(commit, salt);
     }
 
-    // Ticket Hashing Functions
-
-    // Compute the full EIP-191 signed hash that the client signs.
+    // Hashing: EIP-191 signatures verify karne ke liye structured ticket message generate karta hai.
     function getHash(Ticket calldata ticket) public view returns (bytes32) {
         bytes32 h = keccak256(
             abi.encode(
@@ -334,22 +364,23 @@ contract CipherContract {
         return keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", h));
     }
 
-    // Derive the unique nullifier for a ticket to prevent replay attacks.
-    function _getNullifier(Ticket calldata ticket) public view returns (bytes32) {
+    // Nullifier Generator: Replay attack block karne ke liye ticket properties hash karta hai (including futureBlock and amount).
+    function _getNullifier(Ticket calldata ticket) internal view returns (bytes32) {
         return keccak256(
             abi.encode(
                 block.chainid,
                 address(this),
                 ticket.channelId,
                 ticket.client,
-                ticket.nonce
+                ticket.provider,
+                ticket.amount,
+                ticket.nonce,
+                ticket.futureBlock
             )
         );
     }
 
-    // Signature Recovery
-
-    // Recover the signer from a ticket hash and signature with malleability checks.
+    // Recover Signer: ECDSA signature se payload sign karne wale client ka wallet address extract karta hai.
     function _recoverSigner(bytes32 hash, bytes calldata sig) internal pure returns (address) {
         if (sig.length != 65) revert BadSigner();
 
@@ -363,8 +394,8 @@ contract CipherContract {
             v := byte(0, calldataload(add(sig.offset, 0x40)))
         }
 
-        // Check signature malleability (s > n/2)
-        if (uint256(s) > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E735E5AFAED1537A57D8F045F3B) {
+        // secp256k1 standard limit check taaki signature structure bypass na ho sake.
+        if (uint256(s) > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0) {
             revert BadSigner();
         }
 
@@ -376,17 +407,23 @@ contract CipherContract {
         return signer;
     }
 
-    // Ticket Claiming Logic
+    // --- claimTicket: Main Settlement Logic ---
 
-    // Claim a probabilistic ticket by verifying signature, timing, and winning threshold.
+    // Micropayment claim submit karne ka core execution path.
+    // Isme block hash entropy check, signature parsing, aur payout transfer sequence handle hote hain.
     function claimTicket(Ticket calldata ticket, bytes calldata sig) external nonReentrant {
+        // Replay validation: Nullifier checks.
         bytes32 nullifier = _getNullifier(ticket);
         if (usedNullifiers[nullifier]) revert TicketUsed();
 
-        // Validate channel parameters
+        // Parameters limits verification.
+        if (ticket.amount == 0) revert ZeroAmount();
+        if (ticket.winProbab == 0 || ticket.winProbab > probabDenom) revert WinProbabTooHigh();
+
+        // Channel state validation.
         Channel storage c = channels[ticket.channelId];
         if (c.deposit == 0) revert ChannelNotFound();
-        if (c.unlockBlock != 0) revert ChannelLocked();
+        if (c.closureInitiated && block.number >= c.unlockBlock) revert ChannelLocked();
 
         address client = channelClient[ticket.channelId];
         address provider = channelProvider[ticket.channelId];
@@ -395,12 +432,12 @@ contract CipherContract {
         if (provider != ticket.provider) revert("Provider mismatch");
         if (!providers[ticket.provider].registered) revert NotRegistered();
 
-        // Verify the client's signature
+        // ECDSA signature verification.
         bytes32 hash = getHash(ticket);
         address signer = _recoverSigner(hash, sig);
         if (signer != ticket.client) revert BadSigner();
 
-        // Validate block entropy window
+        // Timing validation: Block has been mined aur lookback historical limits me hai.
         if (block.number <= ticket.futureBlock) revert("Block not mined yet");
         if (block.number > ticket.futureBlock + blockLookback) {
             revert InvalidBlock();
@@ -409,10 +446,11 @@ contract CipherContract {
         bytes32 bh = blockhash(ticket.futureBlock);
         if (bh == bytes32(0)) revert("Missing blockhash");
 
-        // Validate salt and ensure it was committed before the target block
+        // Salt reveal verify karo.
         bytes32 salt = saltRevealed[ticket.saltCommit];
         if (salt == bytes32(0)) revert SaltNotRevealed();
 
+        // Salt target block mine hone se pehle ka committed hona chahiye.
         if (saltCommitBlock[ticket.saltCommit] >= ticket.futureBlock) {
             revert SaltCommittedTooLate();
         }
@@ -421,23 +459,24 @@ contract CipherContract {
             revert("Salt not from provider");
         }
 
-        // Cap individual ticket payouts to 25% of channel capacity
+        // Single claim validation: 25% total cap check.
         uint256 available = c.deposit - c.spent;
         uint256 maxAllowed = (available * maxTicketPct) / 100;
         if (ticket.amount > maxAllowed) revert TicketExceedsLimit();
 
-        // Calculate lottery outcome
+        // Entropy Generation: Target blockhash + Provider revealed salt + Nullifier unique variables.
         bytes32 entropy = keccak256(abi.encodePacked(bh, salt, nullifier));
-        uint256 winProbab = ticket.winProbab;
-        if (winProbab > probabDenom) revert WinProbabTooHigh();
 
-        bool won = (uint256(entropy) % probabDenom) < winProbab;
+        // Lottery Outcome evaluation: Probability match.
+        bool won = (uint256(entropy) % probabDenom) < ticket.winProbab;
 
-        // Consume nullifier before triggering payout
+        // Tx process hone par nullifier ko consumption list me daal do (Jeete ya Haare ticket dobara nahi chalega).
         usedNullifiers[nullifier] = true;
 
         if (won) {
             _payProvider(ticket.channelId, ticket.amount);
+        } else {
+            emit TicketLost(nullifier, ticket.channelId, ticket.provider, ticket.amount);
         }
 
         emit TicketClaimed(
@@ -449,9 +488,8 @@ contract CipherContract {
         );
     }
 
-    // View Helpers
+    // --- View Helpers ---
 
-    // Get channel details.
     function getChannel(uint256 channelId)
         external
         view
@@ -460,7 +498,8 @@ contract CipherContract {
             address provider,
             uint256 deposit,
             uint256 spent,
-            uint256 unlockBlock
+            uint256 unlockBlock,
+            bool closureInitiated
         )
     {
         Channel storage c = channels[channelId];
@@ -469,28 +508,29 @@ contract CipherContract {
             channelProvider[channelId],
             c.deposit,
             c.spent,
-            c.unlockBlock
+            c.unlockBlock,
+            c.closureInitiated
         );
     }
 
-    // Check if a nullifier has been used.
     function isNullifierUsed(bytes32 nullifier) external view returns (bool) {
         return usedNullifiers[nullifier];
     }
 
-    // Get the revealed salt for a commit.
     function getSalt(bytes32 commit) external view returns (bytes32) {
         return saltRevealed[commit];
     }
 
-    // Get the block number when a salt was committed.
     function getSaltCommitBlock(bytes32 commit) external view returns (uint256) {
         return saltCommitBlock[commit];
     }
 
-    // Get the spendable balance of a channel.
     function channelBalance(uint256 channelId) external view returns (uint256) {
         Channel storage c = channels[channelId];
         return c.deposit - c.spent;
+    }
+
+    function getPendingWithdrawal(address provider) external view returns (uint256) {
+        return pendingWithdrawals[provider];
     }
 }

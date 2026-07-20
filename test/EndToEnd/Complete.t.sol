@@ -15,7 +15,7 @@ contract CipherTest is Test {
 
     function setUp() public {
         client = vm.addr(clientPk);
-        broker = new CipherContract();
+        broker = new CipherContract(address(0x9999));
 
         // Funding initial balances so test actors can stake & fund channels
         vm.deal(provider, 10 ether);
@@ -53,6 +53,22 @@ contract CipherTest is Test {
         return abi.encodePacked(r, s, v);
     }
 
+    // Helper: Calculate the nullifier locally since it is internal in the contract
+    function _getNullifier(CipherContract.Ticket memory ticket) internal view returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                block.chainid,
+                address(broker),
+                ticket.channelId,
+                ticket.client,
+                ticket.provider,
+                ticket.amount,
+                ticket.nonce,
+                ticket.futureBlock
+            )
+        );
+    }
+
     // PROVIDER REGISTRATION & UNSTAKING TESTS 
     function test_RegisterAndUnregister() public {
         assertTrue(broker.isProvider(provider));
@@ -78,7 +94,7 @@ contract CipherTest is Test {
 
     function test_OpenAndCloseChannel() public {
         uint256 id = 1;
-        (address cl, address pr, uint256 deposit, uint256 spent, uint256 unlockBlock) = broker.getChannel(id);
+        (address cl, address pr, uint256 deposit, uint256 spent, uint256 unlockBlock, ) = broker.getChannel(id);
         
         assertEq(cl, client);
         assertEq(pr, provider);
@@ -91,7 +107,7 @@ contract CipherTest is Test {
         broker.closeChannel(id);
 
         // Unlock block must be scheduled in future to give provider time to redeem outstanding tickets
-        (, , , , unlockBlock) = broker.getChannel(id);
+        (, , , , unlockBlock, ) = broker.getChannel(id);
         assertTrue(unlockBlock > 0);
     }
 
@@ -136,11 +152,15 @@ contract CipherTest is Test {
         vm.prank(provider);
         broker.claimTicket(ticket, sig);
 
+        // Withdraw the pending funds (pull-payment pattern)
+        vm.prank(provider);
+        broker.withdrawPending();
+
         // Verify payout and double-spend nullifier tracking
         assertEq(provider.balance - before, 0.5 ether);
-        assertTrue(broker.isNullifierUsed(broker._getNullifier(ticket)));
+        assertTrue(broker.isNullifierUsed(_getNullifier(ticket)));
 
-        (, , , uint256 spent, ) = broker.getChannel(1);
+        (, , , uint256 spent, , ) = broker.getChannel(1);
         assertEq(spent, 0.5 ether);
     }
 
@@ -170,7 +190,7 @@ contract CipherTest is Test {
 
         // Money remains in channel, but nullifier consumed anyway so ticket can't be replayed!
         assertEq(provider.balance, before);
-        assertTrue(broker.isNullifierUsed(broker._getNullifier(ticket)));
+        assertTrue(broker.isNullifierUsed(_getNullifier(ticket)));
     }
 
     // SECURITY TESTS
@@ -285,6 +305,6 @@ contract CipherTest is Test {
         broker.claimTicket(ticket, sig);
 
         // Verification: Regardless of win/loss outcome, nullifier must be consumed
-        assertTrue(broker.isNullifierUsed(broker._getNullifier(ticket)));
+        assertTrue(broker.isNullifierUsed(_getNullifier(ticket)));
     }
 }
