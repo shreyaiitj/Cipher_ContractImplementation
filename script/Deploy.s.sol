@@ -16,3 +16,4 @@ contract DeployCipher is Script {
         vm.stopBroadcast();
     }
 }
+
