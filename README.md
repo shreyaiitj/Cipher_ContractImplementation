@@ -4,8 +4,6 @@ Built with Foundry | Solidity 0.8.24
 
 This repository implements the settlement layer that handles the money, payment channels, staking, and lottery-based micropayments for the protocol. All core functionalities are consolidated within a single contract, `Contract.sol` (containing `CipherContract`), optimized for gas efficiency, lower deployment costs, and simpler state management.
 
----
-
 ## Core Architecture & Features
 
 The contract handles three main responsibilities:
@@ -74,17 +72,8 @@ sequenceDiagram
 7.  **Pull-Payment Settlement**: If the claim is valid, the contract credits the payout to the provider's `pendingWithdrawals` mapping.
 8.  **Withdrawal**: The provider calls `withdrawPending()` to retrieve their accumulated payouts.
 
----
-
 ## How the Randomness & Salt Timing Works
-
 We use a two-step commit-reveal scheme:
-1.  **Commit**: First, the provider picks a secret salt, hashes it, and submits the hash (`commitSalt`) to the contract. The provider is now locked in — they cannot change their salt later.
+1.  **Commit**: First, the provider picks a secret salt, hashes it, and submits the hash (`commitSalt`) to the contract. The provider is now locked in they cannot change their salt later.
 2.  **Reveal**: Once the target block is mined and its blockhash is public, the provider reveals their salt (`revealSalt`). The contract checks that the hash matches the commitment and verifies the salt was committed *before* the target block was mined.
 3.  **Why Salt Timing Matters**: If a provider could wait until after the block was mined to commit their salt, they could try thousands of salts off-chain until they found one that made the ticket win. By enforcing `saltCommitBlock[ticket.saltCommit] < ticket.futureBlock`, the provider cannot predict the blockhash or manipulate the lottery outcome.
-
----
-
-## Key Developer Notes
-*   **Hinglish Code Comments**: Inline comments in `Contract.sol` are written in Hinglish to help Indian developers understand the logic behind EVM lookbacks, reentrancy guards, and unbonding lock resets quickly.
-*   **Verification**: Run automated tests via `forge test` to verify complete protocol execution.
