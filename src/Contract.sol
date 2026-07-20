@@ -245,16 +245,6 @@ contract CipherContract is ReentrancyGuard {
         emit ChannelOpened(id, msg.sender, provider, msg.value);
     }
 
-    // Active channel me additional balance/deposit top up karne ke liye.
-    function topUpChannel(uint256 channelId) external payable nonReentrant {
-        Channel storage c = channels[channelId];
-        if (c.deposit == 0) revert ChannelNotFound();
-        if (c.closureInitiated) revert ChannelLocked();
-        if (msg.sender != channelClient[channelId]) revert NotChannelParty();
-        if (msg.value == 0) revert ZeroAmount();
-
-        c.deposit += msg.value;
-    }
 
     // Client/Provider channel close karne ki request trigger karte hain.
     // Provider ko safe rakhne ke liye, ek unbonding delay aur dispute windows (lock window) add ho jata hai.
