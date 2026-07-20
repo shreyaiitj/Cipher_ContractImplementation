@@ -31,14 +31,14 @@ contract CipherContract is ReentrancyGuard {
 
     struct Provider {
         uint256 stake;         
-        uint64 unstakeBlock; // Block number jab unbonding complete hogi aur fund withdraw kar payenge.
+        uint64 unstakeBlock; // Block number jab unbonding complete hogi aur fund withdraw kar payenge
         bool registered;        
     }
 
     struct Channel {
         uint256 deposit;            
         uint256 spent;              
-        uint64 unlockBlock; // Unlock block timestamp (is block ke baad client fund nikal sakta hai).
+        uint64 unlockBlock; // Unlock block timestamp (is block ke baad client fund nikal sakta hai)
         uint64 closureRequestedAt;  
         bool closureInitiated;      
     }
@@ -54,7 +54,7 @@ contract CipherContract is ReentrancyGuard {
         bytes32 saltCommit;    
     }
 
-    mapping(address => Provider) public providers; // Wallet address to Provider struct storage.
+    mapping(address => Provider) public providers; // Wallet address to Provider struct storage
     uint256 public nextChannelId = 1;                       
     mapping(uint256 => Channel) public channels;            
     mapping(uint256 => address) public channelClient;       
@@ -128,7 +128,7 @@ contract CipherContract is ReentrancyGuard {
         uint256 slashAmount = amount > p.stake ? p.stake : amount;
         p.stake -= slashAmount;
         if (p.stake == 0) {
-            p.registered = false; // Agar provider ka sara stake chala jaye, to automatic deregister kardo.
+            p.registered = false; // Agar provider ka sara stake chala jaye, to automatic deregister kardo
         }
         (bool ok, ) = treasury.call{value: slashAmount}("");
         if (!ok) revert TransferFailed();
@@ -143,7 +143,7 @@ contract CipherContract is ReentrancyGuard {
         return providers[provider].stake;
     }
 
-    function openChannel(address provider) external payable nonReentrant { // Client cash (deposit) lock karta hai provider ke against.
+    function openChannel(address provider) external payable nonReentrant { // Client cash lock karta hai provider ke against
         if (!providers[provider].registered) revert NotRegistered();
         if (msg.value == 0) revert ZeroAmount();
         uint256 id = nextChannelId++;
@@ -159,7 +159,7 @@ contract CipherContract is ReentrancyGuard {
         emit ChannelOpened(id, msg.sender, provider, msg.value);
     }
 
-    function closeChannel(uint256 channelId) external nonReentrant { // Provider ko safe rakhne ke liye, ek unbonding delay aur dispute window is added. Is lock window ke andr provider outstanding claims submit kar sakta hai.
+    function closeChannel(uint256 channelId) external nonReentrant { // Provider ko safe rakhne ke liye, ek unbonding delay aur dispute window is added Is lock window ke andr provider outstanding claims submit kar sakta hai
         Channel storage c = channels[channelId];
         if (c.deposit == 0) revert ChannelNotFound();
         if (c.closureInitiated) revert ChannelLocked();
@@ -168,10 +168,10 @@ contract CipherContract is ReentrancyGuard {
         }
         c.closureInitiated = true;
         c.closureRequestedAt = uint64(block.number);
-        c.unlockBlock = uint64(block.number + unbondingPeriod + disputePeriod); // Pura exit timing = unbonding timer + 12-hour dispute delay.
-    }
+        c.unlockBlock = uint64(block.number + unbondingPeriod + disputePeriod); // Pura exit timing = unbonding timer + 12-hour dispute delay
+        }
 
-    function withdrawChannel(uint256 channelId) external nonReentrant { // Unlock period complete hone ke baad client remaining balances (deposit - spent) nikal sakta hai.
+    function withdrawChannel(uint256 channelId) external nonReentrant { // Unlock period complete hone ke baad client remaining balances (deposit - spent) nikal sakta hai
         Channel storage c = channels[channelId];
         if (c.deposit == 0) revert ChannelNotFound();
         if (!c.closureInitiated) revert("Channel not closing");
@@ -185,7 +185,7 @@ contract CipherContract is ReentrancyGuard {
         emit ChannelClosed(channelId, msg.sender, remaining);
     }
 
-    function _payProvider(uint256 channelId, uint256 amount) internal { // Micropayment internal handler: Balance deduct karta hai aur provider ke pending claim account me update karta hai. Agar channel close timing block cross ho chuka ho, tab balance freeze ho jata hai.
+    function _payProvider(uint256 channelId, uint256 amount) internal { // Micropayment internal handler: Balance deduct karta hai aur provider ke pending claim account me update karta hai Agar channel close timing block cross ho chuka ho, tab balance freeze ho jata hai
         Channel storage c = channels[channelId];
         if (c.deposit == 0) revert ChannelNotFound();
         if (c.closureInitiated && block.number >= c.unlockBlock) revert ChannelLocked();
