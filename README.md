@@ -1,4 +1,4 @@
-# Cipher Settlement Protocol
+# Cipher Protocol
 
 Built with Foundry | Solidity 0.8.24 
 
